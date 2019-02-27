@@ -1,49 +1,287 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <title>My Awesome Presentation</title>
-    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
-    <style type="text/css">
-      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
-      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
-      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
-      body { font-family: 'Droid Serif'; }
-      h1, h2, h3 {
-        font-family: 'Yanone Kaffeesatz';
-        font-weight: normal;
-      }
-      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
-    </style>
-  </head>
-  <body>
-    <textarea id="source">
 
-class: center, middle
+<head>
+  <title>Exploring DynamoDB Transactions</title>
+  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+  <style type="text/css">
+    @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+    @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+    @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
 
-# My Awesome Presentation
+    body {
+      font-family: 'Droid Serif';
+    }
 
-???
+    h1,
+    h2,
+    h3 {
+      font-family: 'Yanone Kaffeesatz';
+      font-weight: normal;
+    }
 
-Notes for the _first_ slide!
+    .remark-code,
+    .remark-inline-code {
+      font-family: 'Ubuntu Mono';
+    }
+  </style>
+</head>
+
+<body>
+  <textarea id="source">
+
+
+# Exploring DynamoDB Transactions
+
+
+1. Example Domain
+1. Issues with non-tx solution
+1. DDB TXs to the Rescue
+1. Code
+1. Notes 
 
 ---
 
-# Agenda
+# Example Domain
 
-1. Introduction
-2. Deep-dive
-3. ...
+- Example domain: 
+  - `UserProfile`
+     - `userId`
+     - `name`
+     - `subtitle`
 
-[NOTE]: Note that you need active internet connection to access remark.js script file
+- Event Sourcing:
+  - Store all changes to a user profile as **events**
+     - `ProfileCreated(userId, name, subtitle)`
+     - `SubtitleChanged(userId, subtitle)`
+     - ...
+  - Store the **current state** of the user profile
+
 ---
 
-# Introduction
+# 2 DDB tables
+
+
+- `profile-events`
+  - Contains all **events** of the user profile
+  - Hash: `userId`
+  - Range: `sequenceNumber`
+
+
+
+- `profile-state`
+  - Represents the **current state** of the user profile
+  - Hash: `userId` (no Range key)
+
+
+---
+
+# Example (1)
+```
+profile-events
++--------+-------+----------------------------------------+
+| userId | seqNr | event                                  |
++--------+-------+----------------------------------------+
+|   123  |   1   | ProfileCreated(123, simonmit, foo)     |
++--------+-------+----------------------------------------+
+|   123  |   2   | SubtitleChanged(123, bar)              |
++--------+-------+----------------------------------------+
+|        |       |                                        |
++--------+-------+----------------------------------------+
+
+
+profile-state:  
++--------+----------+----------------------------------------------+
+| userId | curSeqNr |          currentState                        |
++--------+----------+----------------------------------------------+
+|   123  |     2    | UserProfile(123, simonmit, bar)              |
++--------+----------+----------------------------------------------+
+.
+```
+
+---
+
+# Example (2)
+```
+profile-events
++--------+-------+----------------------------------------+
+| userId | seqNr | event                                  |
++--------+-------+----------------------------------------+
+|   123  |   1   | ProfileCreated(123, simonmit, foo)     |
++--------+-------+----------------------------------------+
+|   123  |   2   | SubtitleChanged(123, bar)              |
++--------+-------+----------------------------------------+
+|        |       |                                        |
++--------+-------+----------------------------------------+
+
+
+profile-state:  
++--------+----------+----------------------------------------------+
+| userId | curSeqNr |          currentState                        |
++--------+----------+----------------------------------------------+
+|   123  |     2    | UserProfile(123, simonmit, bar)              |
++--------+----------+----------------------------------------------+
+.
+```
+**new command:**
+- `ChangeSubtitle(123, "DDB TXs FTW")`
+
+
+---
+
+# Example (3)
+```
+profile-events
++--------+-------+----------------------------------------+
+| userId | seqNr | event                                  |
++--------+-------+----------------------------------------+
+|   123  |   1   | ProfileCreated(123, simonmit, foo)     |
++--------+-------+----------------------------------------+
+|   123  |   2   | SubtitleChanged(123, bar)              |
++--------+-------+----------------------------------------+
+|   123  |   3   | SubtitleChanged(123, "DDB TXs FTW")    |
++--------+-------+----------------------------------------+
+
+
+profile-state:  
++--------+----------+----------------------------------------------+
+| userId | curSeqNr |          currentState                        |
++--------+----------+----------------------------------------------+
+|   123  |     2    | UserProfile(123, simonmit, bar)              |
++--------+----------+----------------------------------------------+
+              /\                                 /\
+```
+- Updating `profile-state` failed ! 
+- System is in an **inconsistent state**
+
+---
+
+# DDB TXs to the Rescue
+
+- Provide all-or-nothing semantics
+- ACID
+- Across multiple tables
+- Actions: `Put, Update, Delete, ConditionCheck`
+- See Notes later
+
+---
+
+
+# code (1/4)
+
+- Apply event to current state to derive new state
+- Insert event
+- Update current state with the derived new state
+- Put it into a TX
+
+```scala
+def insertEventAndUpdateState(event: Event, nextState: UserProfile)
+```  
+  
+
+---
+
+# code (2/4)
+
+```
+profile-events:  
++--------+-------+----------------------------------------+
+| userId | seqNr | event                                  |
++--------+-------+----------------------------------------+
+|   123  |   3   | SubtitleChanged(123, "DDB TXs FTW")    |
++--------+-------+----------------------------------------+
+```
+
+```scala
+// PK for this event:
+val userId    = event.userId
+val nextSeqNr = nextState.curSeqNr
+val ddbRecord = toDDB(userId, nextSeqNr, event)
+
+// insert new event 
+val putNewEvent = Put.builder.tableName("profile-events")
+  // The composite PK must not yet exists (for any event)
+  .conditionExpression(
+    "attribute_not_exists(userId) AND attribute_not_exists(sequenceNumber)"
+  )
+  .item( ddbRecord ).build
+
+```
+
+
+---
+
+# code (3/4)
+```
+profile-state:  
++--------+----------+----------------------------------------------+
+| userId | curSeqNr |          currentState                        |
++--------+----------+----------------------------------------------+
+|   123  |     3    | UserProfile(123, simonmit, "DDB TXs FTW")    |
++--------+----------+----------------------------------------------+
+```
+```scala
+// update state
+val putUpdatedState = Put.builder.tableName("profile-state")
+    // the composite PK already exits
+  .conditionExpression(
+    "attribute_exists(userId) AND curSeqNr = :sn"
+  )
+  .expressionAttributeValues(
+    // previous seqNr - was not modified in the meantime
+    Map(":sn" ->  AttributeValue.builder.n(nextState.sequenceNumber - 1) )
+  )
+  .item(toDDB(nextState)).build
+
+```
+
+
+---
+
+# code (4/4)
+
+```scala
+val putNewEvent: Put     = ???
+val putUpdatedState: Put = ???
+
+// put both inside request 
+val request = TransactWriteItemsRequest
+  .builder
+  .transactItems(     
+    TransactWriteItem.builder.put(putNewEvent).build,
+    TransactWriteItem.builder.put(putUpdatedState).build,
+  )
+  .build
+ddbClient.transactWriteItems(request)
+```
+
+
+---
+
+# Notes
+
+- Max.  10 items in TX request
+- either TX read or TX write - not both in a TX request
+- Costs: 2 WCU/RCU per item instead of 1
+- DDBLocal (Docker) supports transactions
+- Updating same item multiple times is not supported (within a transaction)
+- Examples use AWS Java SDK 2
+  - Some parts were simplified
+
+- Links:
+  - https://aws.amazon.com/blogs/aws/new-amazon-dynamodb-transactions/
+  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transactions.html
+  - https://martinfowler.com/eaaDev/EventSourcing.html
+
+
+---
 
     </textarea>
-    <script src="https://remarkjs.com/downloads/remark-latest.min.js" type="text/javascript">
-    </script>
-    <script type="text/javascript">
-      var slideshow = remark.create();
-    </script>
-  </body>
+  <script src="https://remarkjs.com/downloads/remark-latest.min.js" type="text/javascript">
+  </script>
+  <script type="text/javascript">
+    var slideshow = remark.create();
+  </script>
+</body>
+
 </html>
