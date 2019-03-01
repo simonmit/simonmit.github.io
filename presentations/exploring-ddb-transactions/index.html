@@ -30,55 +30,66 @@
 <body>
   <textarea id="source">
 
+class: center, middle
 
 # Exploring DynamoDB Transactions
 
+<image src="https://upload.wikimedia.org/wikipedia/commons/thumb/f/fd/DynamoDB.png/220px-DynamoDB.png" />
 
-1. Example Domain
-1. Issues with non-tx solution
-1. DDB TXs to the Rescue
-1. Code
-1. Notes 
+.footnote.small.faded.align-center[
+by Simon Mit. 
+
+https://simonmit.github.io/
+
+Senior Engineer @ AutoScout24
+]
 
 ---
 
-# Example Domain
+### Example Domain
 
-- Example domain: 
-  - `UserProfile`
-     - `userId`
-     - `name`
-     - `subtitle`
+- `UserProfile`
+    - `userId`
+    - `name`
+    - `subtitle`
 
-- Event Sourcing:
+--
+
+### Event Sourcing:
   - Store all changes to a user profile as **events**
      - `ProfileCreated(userId, name, subtitle)`
      - `SubtitleChanged(userId, subtitle)`
      - ...
   - Store the **current state** of the user profile
 
+--
+
+### Updating 2 tables at the same
+### => Transactions !
+
 ---
 
-# 2 DDB tables
+
+## 2 DDB Tables
 
 
-- `profile-events`
+### `events`
   - Contains all **events** of the user profile
-  - Hash: `userId`
-  - Range: `sequenceNumber`
+  - Composite Primary Key:
+    - Hash: `userId`
+    - Range: `sequenceNumber`
 
+--
 
-
-- `profile-state`
+### `state`
   - Represents the **current state** of the user profile
   - Hash: `userId` (no Range key)
 
 
 ---
 
-# Example (1)
+### events
 ```
-profile-events
 +--------+-------+----------------------------------------+
 | userId | seqNr | event                                  |
 +--------+-------+----------------------------------------+
@@ -88,22 +99,20 @@ profile-events
 +--------+-------+----------------------------------------+
 |        |       |                                        |
 +--------+-------+----------------------------------------+
-
-
-profile-state:  
+```
+### state
+```
 +--------+----------+----------------------------------------------+
 | userId | curSeqNr |          currentState                        |
 +--------+----------+----------------------------------------------+
 |   123  |     2    | UserProfile(123, simonmit, bar)              |
 +--------+----------+----------------------------------------------+
-.
 ```
 
 ---
 
-# Example (2)
+### events
 ```
-profile-events
 +--------+-------+----------------------------------------+
 | userId | seqNr | event                                  |
 +--------+-------+----------------------------------------+
@@ -113,25 +122,25 @@ profile-events
 +--------+-------+----------------------------------------+
 |        |       |                                        |
 +--------+-------+----------------------------------------+
+```
 
-
-profile-state:  
+### state
+```
 +--------+----------+----------------------------------------------+
 | userId | curSeqNr |          currentState                        |
 +--------+----------+----------------------------------------------+
 |   123  |     2    | UserProfile(123, simonmit, bar)              |
 +--------+----------+----------------------------------------------+
-.
+
 ```
+
 **new command:**
 - `ChangeSubtitle(123, "DDB TXs FTW")`
 
-
 ---
 
-# Example (3)
+### events
 ```
-profile-events
 +--------+-------+----------------------------------------+
 | userId | seqNr | event                                  |
 +--------+-------+----------------------------------------+
@@ -141,9 +150,39 @@ profile-events
 +--------+-------+----------------------------------------+
 |   123  |   3   | SubtitleChanged(123, "DDB TXs FTW")    |
 +--------+-------+----------------------------------------+
+```
+
+### state
+```
++--------+----------+----------------------------------------------+
+| userId | curSeqNr |          currentState                        |
++--------+----------+----------------------------------------------+
+|   123  |     2    | UserProfile(123, simonmit, bar)              |
++--------+----------+----------------------------------------------+
+.
+```
+
+1. Insert event
+2. Update state
 
 
-profile-state:  
+---
+
+### events
+```
++--------+-------+----------------------------------------+
+| userId | seqNr | event                                  |
++--------+-------+----------------------------------------+
+|   123  |   1   | ProfileCreated(123, simonmit, foo)     |
++--------+-------+----------------------------------------+
+|   123  |   2   | SubtitleChanged(123, bar)              |
++--------+-------+----------------------------------------+
+|   123  |   3   | SubtitleChanged(123, "DDB TXs FTW")    |
++--------+-------+----------------------------------------+
+```
+
+### state
+```
 +--------+----------+----------------------------------------------+
 | userId | curSeqNr |          currentState                        |
 +--------+----------+----------------------------------------------+
@@ -151,23 +190,25 @@ profile-state:
 +--------+----------+----------------------------------------------+
               /\                                 /\
 ```
-- Updating `profile-state` failed ! 
-- System is in an **inconsistent state**
+1. Insert event
+2. Update state => FAILED
+  - System is in an **inconsistent state**
 
 ---
 
-# DDB TXs to the Rescue
+### DDB Transactions to the Rescue
 
 - Provide all-or-nothing semantics
 - ACID
 - Across multiple tables
-- Actions: `Put, Update, Delete, ConditionCheck`
-- See Notes later
+- Actions for Write: `Put, Update, Delete, ConditionCheck`
+- Actions for Read: `Get`
+- See notes at the end of the talk
 
 ---
 
 
-# code (1/4)
+## code (1/4)
 
 - Apply event to current state to derive new state
 - Insert event
@@ -181,10 +222,10 @@ def insertEventAndUpdateState(event: Event, nextState: UserProfile)
 
 ---
 
-# code (2/4)
+## code (2/4)
 
 ```
-profile-events:  
+events:  
 +--------+-------+----------------------------------------+
 | userId | seqNr | event                                  |
 +--------+-------+----------------------------------------+
@@ -199,7 +240,7 @@ val nextSeqNr = nextState.curSeqNr
 val ddbRecord = toDDB(userId, nextSeqNr, event)
 
 // insert new event 
-val putNewEvent = Put.builder.tableName("profile-events")
+val putNewEvent = Put.builder.tableName("events")
   // The composite PK must not yet exists (for any event)
   .conditionExpression(
     "attribute_not_exists(userId) AND attribute_not_exists(sequenceNumber)"
@@ -211,9 +252,9 @@ val putNewEvent = Put.builder.tableName("profile-events")
 
 ---
 
-# code (3/4)
+## code (3/4)
 ```
-profile-state:  
+state:  
 +--------+----------+----------------------------------------------+
 | userId | curSeqNr |          currentState                        |
 +--------+----------+----------------------------------------------+
@@ -222,7 +263,7 @@ profile-state:
 ```
 ```scala
 // update state
-val putUpdatedState = Put.builder.tableName("profile-state")
+val putUpdatedState = Put.builder.tableName("state")
     // the composite PK already exits
   .conditionExpression(
     "attribute_exists(userId) AND curSeqNr = :sn"
@@ -238,7 +279,7 @@ val putUpdatedState = Put.builder.tableName("profile-state")
 
 ---
 
-# code (4/4)
+## code (4/4)
 
 ```scala
 val putNewEvent: Put     = ???
@@ -256,25 +297,34 @@ ddbClient.transactWriteItems(request)
 ```
 
 
+- Succeeds or
+- Fails with an exception
+
 ---
 
-# Notes
+### Notes
 
 - Max.  10 items in TX request
-- either TX read or TX write - not both in a TX request
 - Costs: 2 WCU/RCU per item instead of 1
 - DDBLocal (Docker) supports transactions
+- Changes eventually propagate to GSIs and DDB streams
+- Either TX read or TX write - not both in a TX request
 - Updating same item multiple times is not supported (within a transaction)
+
+
 - Examples use AWS Java SDK 2
-  - Some parts were simplified
+  - Some parts were simplified (not compiling)
 
-- Links:
-  - https://aws.amazon.com/blogs/aws/new-amazon-dynamodb-transactions/
-  - https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transactions.html
-  - https://martinfowler.com/eaaDev/EventSourcing.html
+### Links
+
+#### AWS:
+- https://aws.amazon.com/blogs/aws/new-amazon-dynamodb-transactions/
+- https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transactions.html
+
+#### Event Sourcing:
+- https://martinfowler.com/eaaDev/EventSourcing.html
 
 
----
 
     </textarea>
   <script src="https://remarkjs.com/downloads/remark-latest.min.js" type="text/javascript">
